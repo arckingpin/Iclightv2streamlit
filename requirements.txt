@@ -4,5 +4,5 @@ diffusers
 transformers
 safetensors
 pillow
-briarmbg
+rembg
 numpy
