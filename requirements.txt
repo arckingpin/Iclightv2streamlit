@@ -1,7 +1,8 @@
 streamlit
-pandas
+torch
+diffusers
+transformers
+safetensors
+pillow
+briarmbg
 numpy
-matplotlib
-scikit-learn
-requests
-plotly
