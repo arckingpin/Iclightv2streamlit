@@ -1,3 +1,38 @@
+import streamlit as st
+import torch
+from diffusers import DiffusionPipeline
+from PIL import Image
+import numpy as np
+
+# Set device (CPU, since Streamlit Cloud does not support GPUs)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Load the Stable Diffusion model
+@st.cache_resource
+def load_model():
+    model = DiffusionPipeline.from_pretrained(
+        "stabilityai/stable-diffusion-2-1", torch_dtype=torch.float32
+    )
+    model.to(device)
+    return model
+
+model = load_model()
+
+# Streamlit App UI
+st.title("Image Generation with Stable Diffusion")
+
+prompt = st.text_input("Enter a text prompt:")
+generate_button = st.button("Generate Image")
+
+if generate_button and prompt:
+    with st.spinner("Generating image..."):
+        image = model(prompt).images[0]
+        st.image(image, caption="Generated Image", use_column_width=True)
+
+st.write("Powered by Stable Diffusion")
+
+
+
 import os
 import math
 from enum import Enum
