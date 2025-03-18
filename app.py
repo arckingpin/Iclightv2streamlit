@@ -1,42 +1,5 @@
-import streamlit as st
-import torch
-from diffusers import DiffusionPipeline
-from PIL import Image
-import numpy as np
-
-# Set device (CPU, since Streamlit Cloud does not support GPUs)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Load the Stable Diffusion model
-@st.cache_resource
-def load_model():
-    model = DiffusionPipeline.from_pretrained(
-        "stabilityai/stable-diffusion-2-1", torch_dtype=torch.float32
-    )
-    model.to(device)
-    return model
-
-model = load_model()
-
-# Streamlit App UI
-st.title("Image Generation with Stable Diffusion")
-
-prompt = st.text_input("Enter a text prompt:")
-generate_button = st.button("Generate Image")
-
-if generate_button and prompt:
-    with st.spinner("Generating image..."):
-        image = model(prompt).images[0]
-        st.image(image, caption="Generated Image", use_column_width=True)
-
-st.write("Powered by Stable Diffusion")
-
-
-
 import os
 import math
-from enum import Enum
-
 import streamlit as st
 import numpy as np
 import torch
@@ -47,411 +10,104 @@ from diffusers import (
     StableDiffusionImg2ImgPipeline,
     AutoencoderKL,
     UNet2DConditionModel,
-    DDIMScheduler,
-    EulerAncestralDiscreteScheduler,
     DPMSolverMultistepScheduler,
 )
 from diffusers.models.attention_processor import AttnProcessor2_0
 from transformers import CLIPTextModel, CLIPTokenizer
-from briarmbg import BriaRMBG
+from rembg import remove  # Using rembg instead of briarmbg for background removal
 from torch.hub import download_url_to_file
 
-###########################
-#       BG Source         #
-###########################
-class BGSource(Enum):
-    UPLOAD = "Use Background Image"
-    UPLOAD_FLIP = "Use Flipped Background Image"
-    LEFT = "Left Light"
-    RIGHT = "Right Light"
-    TOP = "Top Light"
-    BOTTOM = "Bottom Light"
-    GREY = "Ambient"
 
-###########################
-#   Helper Functions      #
-###########################
-def resize_and_center_crop(image, target_width, target_height):
-    pil_image = Image.fromarray(image)
-    original_width, original_height = pil_image.size
-    scale_factor = max(target_width / original_width, target_height / original_height)
-    resized_width = int(round(original_width * scale_factor))
-    resized_height = int(round(original_height * scale_factor))
-    resized_image = pil_image.resize((resized_width, resized_height), Image.LANCZOS)
-    left = (resized_width - target_width) / 2
-    top = (resized_height - target_height) / 2
-    right = (resized_width + target_width) / 2
-    bottom = (resized_height + target_height) / 2
-    cropped_image = resized_image.crop((left, top, right, bottom))
-    return np.array(cropped_image)
+# Set device (GPU if available, otherwise CPU)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def resize_without_crop(image, target_width, target_height):
-    pil_image = Image.fromarray(image)
-    resized_image = pil_image.resize((target_width, target_height), Image.LANCZOS)
-    return np.array(resized_image)
 
+# Load Models
+@st.cache_resource
+def load_models():
+    model_name = "stablediffusionapi/realistic-vision-v51"
+    tokenizer = CLIPTokenizer.from_pretrained(model_name, subfolder="tokenizer")
+    text_encoder = CLIPTextModel.from_pretrained(model_name, subfolder="text_encoder")
+    vae = AutoencoderKL.from_pretrained(model_name, subfolder="vae")
+    unet = UNet2DConditionModel.from_pretrained(model_name, subfolder="unet")
+
+    # Load Stable Diffusion Pipelines
+    t2i_pipe = StableDiffusionPipeline.from_pretrained(
+        model_name, vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet
+    ).to(device)
+
+    i2i_pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
+        model_name, vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet
+    ).to(device)
+
+    return tokenizer, text_encoder, vae, unet, t2i_pipe, i2i_pipe
+
+
+tokenizer, text_encoder, vae, unet, t2i_pipe, i2i_pipe = load_models()
+
+
+# Background Removal using rembg
+def remove_background(image):
+    image = Image.fromarray(image)
+    output = remove(image)  # rembg removes background
+    output = output.convert("RGBA")
+    np_output = np.array(output)
+    return np_output[..., :3], np_output[..., 3] / 255.0  # Return image and alpha mask
+
+
+# Image Processing
 @torch.inference_mode()
-def numpy2pytorch(imgs):
-    h = torch.from_numpy(np.stack(imgs, axis=0)).float() / 127.0 - 1.0
-    h = h.movedim(-1, 1)
-    return h
-
-@torch.inference_mode()
-def pytorch2numpy(imgs, quant=True):
-    results = []
-    for x in imgs:
-        y = x.movedim(0, -1)
-        if quant:
-            y = y * 127.5 + 127.5
-            y = y.detach().float().cpu().numpy().clip(0, 255).astype(np.uint8)
-        else:
-            y = y * 0.5 + 0.5
-            y = y.detach().float().cpu().numpy().clip(0, 1).astype(np.float32)
-        results.append(y)
-    return results
-
-@torch.inference_mode()
-def encode_prompt_inner(txt: str):
-    max_length = tokenizer.model_max_length
-    chunk_length = tokenizer.model_max_length - 2
-    id_start = tokenizer.bos_token_id
-    id_end = tokenizer.eos_token_id
-    id_pad = id_end
-
-    def pad(x, p, i):
-        return x[:i] if len(x) >= i else x + [p] * (i - len(x))
-
-    tokens = tokenizer(txt, truncation=False, add_special_tokens=False)["input_ids"]
-    chunks = [[id_start] + tokens[i: i + chunk_length] + [id_end] for i in range(0, len(tokens), chunk_length)]
-    chunks = [pad(ck, id_pad, max_length) for ck in chunks]
-
-    token_ids = torch.tensor(chunks).to(device=device, dtype=torch.int64)
-    conds = text_encoder(token_ids).last_hidden_state
-    return conds
-
-@torch.inference_mode()
-def encode_prompt_pair(positive_prompt, negative_prompt):
-    c = encode_prompt_inner(positive_prompt)
-    uc = encode_prompt_inner(negative_prompt)
-
-    c_len = float(len(c))
-    uc_len = float(len(uc))
-    max_count = max(c_len, uc_len)
-    c_repeat = int(math.ceil(max_count / c_len))
-    uc_repeat = int(math.ceil(max_count / uc_len))
-    max_chunk = max(len(c), len(uc))
-
-    c = torch.cat([c] * c_repeat, dim=0)[:max_chunk]
-    uc = torch.cat([uc] * uc_repeat, dim=0)[:max_chunk]
-
-    c = torch.cat([p[None, ...] for p in c], dim=1)
-    uc = torch.cat([p[None, ...] for p in uc], dim=1)
-
-    return c, uc
-
-@torch.inference_mode()
-def run_rmbg(img, sigma=0.0):
-    H, W, C = img.shape
-    assert C == 3, "Input image must have 3 channels"
-    k = (256.0 / float(H * W)) ** 0.5
-    feed = resize_without_crop(img, int(64 * round(W * k)), int(64 * round(H * k)))
-    feed = numpy2pytorch([feed]).to(device=device, dtype=torch.float32)
-    alpha = rmbg(feed)[0][0]
-    alpha = torch.nn.functional.interpolate(alpha, size=(H, W), mode="bilinear")
-    alpha = alpha.movedim(1, -1)[0]
-    alpha = alpha.detach().float().cpu().numpy().clip(0, 1)
-    result = 127 + (img.astype(np.float32) - 127 + sigma) * alpha
-    return result.clip(0, 255).astype(np.uint8), alpha
-
-###########################
-#      Processing         #
-###########################
-@torch.inference_mode()
-def process(input_fg, input_bg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source):
-    bg_source = BGSource(bg_source)
-    if bg_source == BGSource.UPLOAD:
-        pass
-    elif bg_source == BGSource.UPLOAD_FLIP:
-        input_bg = np.fliplr(input_bg)
-    elif bg_source == BGSource.GREY:
-        input_bg = np.zeros((image_height, image_width, 3), dtype=np.uint8) + 64
-    elif bg_source == BGSource.LEFT:
-        gradient = np.linspace(224, 32, image_width)
-        image = np.tile(gradient, (image_height, 1))
-        input_bg = np.stack((image,) * 3, axis=-1).astype(np.uint8)
-    elif bg_source == BGSource.RIGHT:
-        gradient = np.linspace(32, 224, image_width)
-        image = np.tile(gradient, (image_height, 1))
-        input_bg = np.stack((image,) * 3, axis=-1).astype(np.uint8)
-    elif bg_source == BGSource.TOP:
-        gradient = np.linspace(224, 32, image_height)[:, None]
-        image = np.tile(gradient, (1, image_width))
-        input_bg = np.stack((image,) * 3, axis=-1).astype(np.uint8)
-    elif bg_source == BGSource.BOTTOM:
-        gradient = np.linspace(32, 224, image_height)[:, None]
-        image = np.tile(gradient, (1, image_width))
-        input_bg = np.stack((image,) * 3, axis=-1).astype(np.uint8)
-    else:
-        raise ValueError("Wrong background source!")
-
-    rng = torch.Generator(device=device).manual_seed(seed)
-    fg = resize_and_center_crop(input_fg, image_width, image_height)
-    bg = resize_and_center_crop(input_bg, image_width, image_height)
-    concat_conds = numpy2pytorch([fg, bg]).to(device=vae.device, dtype=vae.dtype)
-    concat_conds = vae.encode(concat_conds).latent_dist.mode() * vae.config.scaling_factor
-    concat_conds = torch.cat([c[None, ...] for c in concat_conds], dim=1)
-
-    conds, unconds = encode_prompt_pair(prompt + ', ' + a_prompt, n_prompt)
-    latents = t2i_pipe(
-        prompt_embeds=conds,
-        negative_prompt_embeds=unconds,
+def generate_image(prompt, image_width, image_height, num_samples, steps, seed, cfg):
+    generator = torch.Generator(device=device).manual_seed(seed)
+    result = t2i_pipe(
+        prompt=prompt,
         width=image_width,
         height=image_height,
         num_inference_steps=steps,
         num_images_per_prompt=num_samples,
-        generator=rng,
-        output_type="latent",
         guidance_scale=cfg,
-        cross_attention_kwargs={"concat_conds": concat_conds},
-    ).images.to(vae.dtype) / vae.config.scaling_factor
+        generator=generator,
+    ).images
 
-    pixels = vae.decode(latents).sample
-    pixels = pytorch2numpy(pixels)
-    pixels = [resize_without_crop(
-        image=p,
-        target_width=int(round(image_width * highres_scale / 64.0) * 64),
-        target_height=int(round(image_height * highres_scale / 64.0) * 64))
-        for p in pixels]
+    return result
 
-    pixels = numpy2pytorch(pixels).to(device=vae.device, dtype=vae.dtype)
-    latents = vae.encode(pixels).latent_dist.mode() * vae.config.scaling_factor
-    latents = latents.to(device=unet.device, dtype=unet.dtype)
 
-    image_height_hr, image_width_hr = latents.shape[2] * 8, latents.shape[3] * 8
-    fg_hr = resize_and_center_crop(input_fg, image_width_hr, image_height_hr)
-    bg_hr = resize_and_center_crop(input_bg, image_width_hr, image_height_hr)
-    concat_conds = numpy2pytorch([fg_hr, bg_hr]).to(device=vae.device, dtype=vae.dtype)
-    concat_conds = vae.encode(concat_conds).latent_dist.mode() * vae.config.scaling_factor
-    concat_conds = torch.cat([c[None, ...] for c in concat_conds], dim=1)
+# Streamlit UI
+st.set_page_config(page_title="IC-Light V2", layout="wide")
+st.title("IC-Light V2: Relighting with Stable Diffusion")
+st.write("Upload your images, set parameters, and generate high-quality relit images.")
 
-    latents = i2i_pipe(
-        image=latents,
-        strength=highres_denoise,
-        prompt_embeds=conds,
-        negative_prompt_embeds=unconds,
-        width=image_width_hr,
-        height=image_height_hr,
-        num_inference_steps=int(round(steps / highres_denoise)),
-        num_images_per_prompt=num_samples,
-        generator=rng,
-        output_type="latent",
-        guidance_scale=cfg,
-        cross_attention_kwargs={"concat_conds": concat_conds},
-    ).images.to(vae.dtype) / vae.config.scaling_factor
-
-    pixels = vae.decode(latents).sample
-    pixels = pytorch2numpy(pixels, quant=False)
-    return pixels, [fg, bg]
-
-@torch.inference_mode()
-def process_relight(input_fg, input_bg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source):
-    input_fg, matting = run_rmbg(input_fg)
-    results, extra_images = process(input_fg, input_bg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source)
-    results = [(x * 255.0).clip(0, 255).astype(np.uint8) for x in results]
-    return results + extra_images
-
-@torch.inference_mode()
-def process_normal(input_fg, input_bg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source):
-    input_fg, matting = run_rmbg(input_fg, sigma=16)
-
-    left = process(input_fg, input_bg, prompt, image_width, image_height, 1, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, BGSource.LEFT.value)[0][0]
-    right = process(input_fg, input_bg, prompt, image_width, image_height, 1, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, BGSource.RIGHT.value)[0][0]
-    bottom = process(input_fg, input_bg, prompt, image_width, image_height, 1, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, BGSource.BOTTOM.value)[0][0]
-    top = process(input_fg, input_bg, prompt, image_width, image_height, 1, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, BGSource.TOP.value)[0][0]
-
-    inner_results = [left * 2.0 - 1.0, right * 2.0 - 1.0, bottom * 2.0 - 1.0, top * 2.0 - 1.0]
-    ambient = (left + right + bottom + top) / 4.0
-    h, w, _ = ambient.shape
-    matting_resized = resize_and_center_crop((matting[..., 0] * 255.0).clip(0, 255).astype(np.uint8), w, h).astype(np.float32)[..., None] / 255.0
-
-    def safa_divide(a, b):
-        e = 1e-5
-        return ((a + e) / (b + e)) - 1.0
-
-    left = safa_divide(left, ambient)
-    right = safa_divide(right, ambient)
-    bottom = safa_divide(bottom, ambient)
-    top = safa_divide(top, ambient)
-
-    u = (right - left) * 0.5
-    v = (top - bottom) * 0.5
-    sigma = 10.0
-    u_mean = np.mean(u, axis=2)
-    v_mean = np.mean(v, axis=2)
-    h_val = (1.0 - u_mean ** 2.0 - v_mean ** 2.0).clip(0, 1e5) ** (0.5 * sigma)
-    z = np.zeros_like(h_val)
-
-    normal = np.stack([u_mean, v_mean, h_val], axis=2)
-    normal = normal / (np.sum(normal ** 2.0, axis=2, keepdims=True) ** 0.5)
-    normal = normal * matting_resized + np.stack([z, z, 1 - z], axis=2) * (1 - matting_resized)
-
-    results = [normal, left, right, bottom, top] + inner_results
-    results = [(x * 127.5 + 127.5).clip(0, 255).astype(np.uint8) for x in results]
-    return results
-
-###########################
-#      Model Loading      #
-###########################
-# Set device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Load tokenizer, text encoder, VAE, UNet and RMBG
-sd15_name = "stablediffusionapi/realistic-vision-v51"
-tokenizer = CLIPTokenizer.from_pretrained(sd15_name, subfolder="tokenizer")
-text_encoder = CLIPTextModel.from_pretrained(sd15_name, subfolder="text_encoder")
-vae = AutoencoderKL.from_pretrained(sd15_name, subfolder="vae")
-unet = UNet2DConditionModel.from_pretrained(sd15_name, subfolder="unet")
-rmbg = BriaRMBG.from_pretrained("briaai/RMBG-1.4")
-
-# Modify UNet’s input convolution to accept additional conditions
-with torch.no_grad():
-    new_conv_in = torch.nn.Conv2d(
-        12, unet.conv_in.out_channels, unet.conv_in.kernel_size, unet.conv_in.stride, unet.conv_in.padding
-    )
-    new_conv_in.weight.zero_()
-    new_conv_in.weight[:, :4, :, :].copy_(unet.conv_in.weight)
-    new_conv_in.bias = unet.conv_in.bias
-    unet.conv_in = new_conv_in
-
-unet_original_forward = unet.forward
-def hooked_unet_forward(sample, timestep, encoder_hidden_states, **kwargs):
-    c_concat = kwargs["cross_attention_kwargs"]["concat_conds"].to(sample)
-    c_concat = torch.cat([c_concat] * (sample.shape[0] // c_concat.shape[0]), dim=0)
-    new_sample = torch.cat([sample, c_concat], dim=1)
-    kwargs["cross_attention_kwargs"] = {}
-    return unet_original_forward(new_sample, timestep, encoder_hidden_states, **kwargs)
-unet.forward = hooked_unet_forward
-
-# Download the offset weights if not already available
-model_path = "./models/iclight_sd15_fbc.safetensors"
-if not os.path.exists(model_path):
-    os.makedirs("./models", exist_ok=True)
-    download_url_to_file(
-        url="https://huggingface.co/lllyasviel/ic-light/resolve/main/iclight_sd15_fbc.safetensors",
-        dst=model_path,
-    )
-
-sd_offset = sf.load_file(model_path)
-sd_origin = unet.state_dict()
-sd_merged = {k: sd_origin[k] + sd_offset[k] for k in sd_origin.keys()}
-unet.load_state_dict(sd_merged, strict=True)
-del sd_offset, sd_origin, sd_merged
-
-# Move models to device
-text_encoder = text_encoder.to(device=device, dtype=torch.float16)
-vae = vae.to(device=device, dtype=torch.bfloat16)
-unet = unet.to(device=device, dtype=torch.float16)
-rmbg = rmbg.to(device=device, dtype=torch.float32)
-
-# Set attention processors
-unet.set_attn_processor(AttnProcessor2_0())
-vae.set_attn_processor(AttnProcessor2_0())
-
-# Define samplers
-ddim_scheduler = DDIMScheduler(
-    num_train_timesteps=1000,
-    beta_start=0.00085,
-    beta_end=0.012,
-    beta_schedule="scaled_linear",
-    clip_sample=False,
-    set_alpha_to_one=False,
-    steps_offset=1,
-)
-euler_a_scheduler = EulerAncestralDiscreteScheduler(
-    num_train_timesteps=1000,
-    beta_start=0.00085,
-    beta_end=0.012,
-    steps_offset=1
-)
-dpmpp_2m_sde_karras_scheduler = DPMSolverMultistepScheduler(
-    num_train_timesteps=1000,
-    beta_start=0.00085,
-    beta_end=0.012,
-    algorithm_type="sde-dpmsolver++",
-    use_karras_sigmas=True,
-    steps_offset=1
-)
-
-# Create pipelines
-t2i_pipe = StableDiffusionPipeline(
-    vae=vae,
-    text_encoder=text_encoder,
-    tokenizer=tokenizer,
-    unet=unet,
-    scheduler=dpmpp_2m_sde_karras_scheduler,
-    safety_checker=None,
-    requires_safety_checker=False,
-    feature_extractor=None,
-    image_encoder=None
-)
-i2i_pipe = StableDiffusionImg2ImgPipeline(
-    vae=vae,
-    text_encoder=text_encoder,
-    tokenizer=tokenizer,
-    unet=unet,
-    scheduler=dpmpp_2m_sde_karras_scheduler,
-    safety_checker=None,
-    requires_safety_checker=False,
-    feature_extractor=None,
-    image_encoder=None
-)
-
-###########################
-#      Streamlit UI       #
-###########################
-st.set_page_config(page_title="IC‑Light V2", layout="wide")
-st.title("IC‑Light V2: Relighting with Foreground and Background Conditions")
-st.write("Upload your images, set the parameters, and choose an operation.")
-
+# Upload Images
 col1, col2 = st.columns(2)
 with col1:
     fg_file = st.file_uploader("Upload Foreground Image", type=["png", "jpg", "jpeg"])
 with col2:
     bg_file = st.file_uploader("Upload Background Image", type=["png", "jpg", "jpeg"])
 
-prompt = st.text_input("Prompt", "beautiful woman, cinematic lighting")
-a_prompt = st.text_input("Added Prompt", "best quality")
-n_prompt = st.text_input("Negative Prompt", "lowres, bad anatomy, bad hands, cropped, worst quality")
-bg_source = st.selectbox("Background Source", [e.value for e in BGSource])
+# User Inputs
+prompt = st.text_input("Prompt", "A cinematic portrait of a beautiful woman")
 num_samples = st.slider("Number of Images", 1, 4, 1)
 seed = st.number_input("Seed", value=12345, step=1)
 image_width = st.slider("Image Width", 256, 1024, 512, step=64)
 image_height = st.slider("Image Height", 256, 1024, 640, step=64)
 steps = st.slider("Steps", 1, 100, 20)
 cfg = st.slider("CFG Scale", 1.0, 32.0, 7.0)
-highres_scale = st.slider("Highres Scale", 1.0, 3.0, 1.5)
-highres_denoise = st.slider("Highres Denoise", 0.1, 0.9, 0.5)
-operation = st.radio("Operation", ("Relight", "Compute Normal (4x Slower)"))
 
-if st.button("Run"):
-    if fg_file is None or bg_file is None:
-        st.error("Please upload both foreground and background images.")
-    else:
+if st.button("Generate Image"):
+    if fg_file:
         input_fg = Image.open(fg_file).convert("RGB")
-        input_bg = Image.open(bg_file).convert("RGB")
-        input_fg_np = np.array(input_fg)
-        input_bg_np = np.array(input_bg)
-        st.write("Processing... please wait.")
-        if operation == "Relight":
-            outputs = process_relight(
-                input_fg_np, input_bg_np, prompt, image_width, image_height, num_samples,
-                seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source
-            )
-        else:
-            outputs = process_normal(
-                input_fg_np, input_bg_np, prompt, image_width, image_height, num_samples,
-                seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source
-            )
-        st.write("Results:")
-        for img in outputs:
+        fg_np = np.array(input_fg)
+
+        # Remove background
+        fg_np, _ = remove_background(fg_np)
+
+        with st.spinner("Generating image..."):
+            results = generate_image(prompt, image_width, image_height, num_samples, steps, seed, cfg)
+
+        st.write("Generated Images:")
+        for img in results:
             st.image(img, use_column_width=True)
+    else:
+        st.error("Please upload a foreground image to proceed.")
+
+st.write("Powered by Stable Diffusion & Streamlit")
